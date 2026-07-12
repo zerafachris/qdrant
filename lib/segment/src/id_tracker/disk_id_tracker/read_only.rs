@@ -25,7 +25,9 @@ use common::universal_io::{
     CachedReadFs, OpenOptions, Populate, ReadRange, TypedStorage, UniversalRead, UniversalReadFs,
 };
 
-use super::mappings::{DiskMappingsSource, log_lookup_err};
+use super::mappings::{
+    DiskMappingsSource, log_lookup_err, log_lookup_err_batch, resolve_external_ids_batch,
+};
 use super::on_disk_format::{e2i_path, i2e_path};
 use super::reader::DiskMappingReader;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -213,6 +215,19 @@ impl<S: UniversalRead> DiskMappingsSource for ReadOnlyDiskIdTracker<S> {
             .unwrap_or(true))
     }
 
+    /// One pipelined pass over the on-disk deleted file (shared `u64` elements
+    /// deduplicated) instead of a `get_bit` round-trip per point. Still no
+    /// full-set load. Out-of-range offsets are treated as deleted.
+    fn points_deleted_batch(&self, offsets: &[PointOffsetType]) -> OperationResult<Vec<bool>> {
+        let bit_indices: Vec<u64> = offsets.iter().map(|&offset| u64::from(offset)).collect();
+        Ok(self
+            .deleted_file
+            .get_bits_batch(&bit_indices)?
+            .into_iter()
+            .map(|bit| bit.unwrap_or(true))
+            .collect())
+    }
+
     fn deleted_bitslice(&self) -> OperationResult<&BitSlice> {
         Ok(self.deleted_full()?.as_bitslice())
     }
@@ -251,6 +266,56 @@ impl<S: UniversalRead> IdTrackerRead for ReadOnlyDiskIdTracker<S> {
 
     fn external_id(&self, internal_id: PointOffsetType) -> Option<PointIdType> {
         log_lookup_err(self.resolve_external(internal_id))
+    }
+
+    fn external_ids_batch(&self, internal_ids: &[PointOffsetType]) -> Vec<Option<PointIdType>> {
+        log_lookup_err_batch(
+            self.resolve_external_batch(internal_ids),
+            internal_ids.len(),
+        )
+    }
+
+    /// One pipelined pass over the versions file instead of a read per point.
+    /// Out-of-range offsets yield `None`; on a storage error the remaining
+    /// slots stay `None` (the batch analogue of the single-lookup fallback).
+    fn internal_versions_batch(
+        &self,
+        internal_ids: &[PointOffsetType],
+    ) -> Vec<Option<SeqNumberType>> {
+        let mut results: Vec<Option<SeqNumberType>> = vec![None; internal_ids.len()];
+
+        let ranges = internal_ids
+            .iter()
+            .enumerate()
+            .filter(|&(_, &internal_id)| u64::from(internal_id) < self.versions_len)
+            .map(|(slot, &internal_id)| {
+                let range = ReadRange {
+                    byte_offset: u64::from(internal_id) * size_of::<SeqNumberType>() as u64,
+                    length: 1,
+                };
+                (slot, range)
+            });
+        let read = self
+            .versions
+            .read_batch::<Random, usize>(ranges, |slot, values| {
+                results[slot] = values.first().copied();
+                Ok(())
+            });
+        if let Err(err) = read {
+            log::error!("disk id tracker batch version read failed: {err}");
+        }
+
+        results
+    }
+
+    /// Batched external→internal resolution; the behavior argument is ignored
+    /// (as in [`internal_id_with_behavior`](IdTrackerRead::internal_id_with_behavior)).
+    fn resolve_external_ids(
+        &self,
+        point_ids: &[PointIdType],
+        _deferred_behavior: DeferredBehavior,
+    ) -> (Vec<PointIdType>, Vec<PointOffsetType>) {
+        resolve_external_ids_batch(self, point_ids)
     }
 
     fn total_point_count(&self) -> usize {

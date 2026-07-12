@@ -15,6 +15,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use ahash::AHashMap;
 use byteorder::{LittleEndian, ReadBytesExt};
 use common::bitvec::{BitSlice, BitSliceExt as _};
 use common::mmap::AdviceSetting;
@@ -159,40 +160,72 @@ impl<S: UniversalRead> DiskMappingReader<S> {
         self.i2e_header.total
     }
 
-    fn read_num_block(&self, block: u64) -> OperationResult<Vec<(u128, PointOffsetType)>> {
+    /// Byte range of numeric run block `block` within `e2i`.
+    fn num_block_range(&self, block: u64) -> ReadRange {
         let bs = u64::from(self.e2i_header.num_block_size);
         let start = block * bs;
         let count = (self.e2i_header.num_count - start).min(bs);
+        ReadRange {
+            byte_offset: self.e2i_header.num_run_offset + start * NUM_ENTRY_SIZE,
+            length: count * NUM_ENTRY_SIZE,
+        }
+    }
+
+    /// Byte range of UUID run block `block` within `e2i`.
+    fn uuid_block_range(&self, block: u64) -> ReadRange {
+        let bs = u64::from(self.e2i_header.uuid_block_size);
+        let start = block * bs;
+        let count = (self.e2i_header.uuid_count - start).min(bs);
+        ReadRange {
+            byte_offset: self.e2i_header.uuid_run_offset + start * UUID_ENTRY_SIZE,
+            length: count * UUID_ENTRY_SIZE,
+        }
+    }
+
+    fn read_num_block(&self, block: u64) -> OperationResult<Vec<(u128, PointOffsetType)>> {
         let bytes = self
             .e2i
-            .read::<common::generic_consts::Random, u8>(ReadRange {
-                byte_offset: self.e2i_header.num_run_offset + start * NUM_ENTRY_SIZE,
-                length: count * NUM_ENTRY_SIZE,
-            })?;
+            .read::<common::generic_consts::Random, u8>(self.num_block_range(block))?;
         Ok(decode_num_block(bytes.as_ref()))
     }
 
     fn read_uuid_block(&self, block: u64) -> OperationResult<Vec<(u128, PointOffsetType)>> {
-        let bs = u64::from(self.e2i_header.uuid_block_size);
-        let start = block * bs;
-        let count = (self.e2i_header.uuid_count - start).min(bs);
         let bytes = self
             .e2i
-            .read::<common::generic_consts::Random, u8>(ReadRange {
-                byte_offset: self.e2i_header.uuid_run_offset + start * UUID_ENTRY_SIZE,
-                length: count * UUID_ENTRY_SIZE,
-            })?;
+            .read::<common::generic_consts::Random, u8>(self.uuid_block_range(block))?;
         Ok(decode_uuid_block(bytes.as_ref()))
     }
 
-    fn lookup_num(&self, key: u64) -> OperationResult<Option<PointOffsetType>> {
+    /// Sparse-index block that can contain numeric key `key`, or `None` when
+    /// the numeric run is empty.
+    fn num_block_of(&self, key: u64) -> Option<u64> {
         if self.e2i_header.num_count == 0 {
-            return Ok(None);
+            return None;
         }
         let block = self
             .num_sparse
             .partition_point(|&first| first <= key)
             .saturating_sub(1) as u64;
+        Some(block)
+    }
+
+    /// Sparse-index block that can contain UUID key `key`, or `None` when the
+    /// UUID run is empty.
+    fn uuid_block_of(&self, key: u128) -> Option<u64> {
+        if self.e2i_header.uuid_count == 0 {
+            return None;
+        }
+        let block = self
+            .uuid_sparse
+            .partition_point(|&first| first <= key)
+            .saturating_sub(1) as u64;
+        Some(block)
+    }
+
+    fn lookup_num(&self, key: u64) -> OperationResult<Option<PointOffsetType>> {
+        let Some(block) = self.num_block_of(key) else {
+            return Ok(None);
+        };
         let entries = self.read_num_block(block)?;
         Ok(entries
             .binary_search_by_key(&u128::from(key), |(k, _)| *k)
@@ -201,13 +234,9 @@ impl<S: UniversalRead> DiskMappingReader<S> {
     }
 
     fn lookup_uuid(&self, key: u128) -> OperationResult<Option<PointOffsetType>> {
-        if self.e2i_header.uuid_count == 0 {
+        let Some(block) = self.uuid_block_of(key) else {
             return Ok(None);
-        }
-        let block = self
-            .uuid_sparse
-            .partition_point(|&first| first <= key)
-            .saturating_sub(1) as u64;
+        };
         let entries = self.read_uuid_block(block)?;
         Ok(entries
             .binary_search_by_key(&key, |(k, _)| *k)
@@ -224,6 +253,82 @@ impl<S: UniversalRead> DiskMappingReader<S> {
         }
     }
 
+    /// Batch counterpart of [`lookup`](Self::lookup): keys are grouped by the
+    /// e2i block that can contain them, every unique block is read once through
+    /// a single pipelined [`read_batch`](UniversalRead::read_batch) pass, and
+    /// each key is binary-searched within its block.
+    ///
+    /// Results are returned in input order; absent ids yield `None`. Deletion
+    /// is NOT applied (same contract as `lookup`); storage errors propagate.
+    pub fn lookup_batch(
+        &self,
+        external_ids: &[PointIdType],
+    ) -> OperationResult<Vec<Option<PointOffsetType>>> {
+        let mut results: Vec<Option<PointOffsetType>> = vec![None; external_ids.len()];
+
+        // Group `(input index, key)` by `(run, block)`, in first-seen order so
+        // the read schedule is deterministic.
+        let mut group_slots: AHashMap<(bool, u64), usize> = AHashMap::new();
+        let mut groups: Vec<BlockLookupGroup> = Vec::new();
+        for (idx, &external_id) in external_ids.iter().enumerate() {
+            let (is_uuid, key, block) = match external_id {
+                PointIdType::NumId(num) => {
+                    let Some(block) = self.num_block_of(num) else {
+                        continue;
+                    };
+                    (false, u128::from(num), block)
+                }
+                PointIdType::Uuid(uuid) => {
+                    let key = uuid.as_u128();
+                    let Some(block) = self.uuid_block_of(key) else {
+                        continue;
+                    };
+                    (true, key, block)
+                }
+            };
+            let slot = *group_slots.entry((is_uuid, block)).or_insert_with(|| {
+                groups.push(BlockLookupGroup {
+                    is_uuid,
+                    block,
+                    keys: Vec::new(),
+                });
+                groups.len() - 1
+            });
+            groups[slot].keys.push((idx, key));
+        }
+
+        let ranges = groups.iter().enumerate().map(|(slot, group)| {
+            let range = if group.is_uuid {
+                self.uuid_block_range(group.block)
+            } else {
+                self.num_block_range(group.block)
+            };
+            (slot, range)
+        });
+        self.e2i
+            .read_batch::<common::generic_consts::Random, u8, usize>(ranges, |slot, bytes| {
+                let BlockLookupGroup {
+                    is_uuid,
+                    block: _,
+                    keys,
+                } = &groups[slot];
+                let entries = if *is_uuid {
+                    decode_uuid_block(bytes)
+                } else {
+                    decode_num_block(bytes)
+                };
+                for &(idx, key) in keys {
+                    results[idx] = entries
+                        .binary_search_by_key(&key, |(k, _)| *k)
+                        .ok()
+                        .map(|pos| entries[pos].1);
+                }
+                Ok(())
+            })?;
+
+        Ok(results)
+    }
+
     /// Internal→external lookup ignoring deletion. `Ok(None)` for out-of-range
     /// offsets; storage errors propagate.
     pub fn external_id(&self, offset: PointOffsetType) -> OperationResult<Option<PointIdType>> {
@@ -231,6 +336,80 @@ impl<S: UniversalRead> DiskMappingReader<S> {
             return Ok(None);
         }
         self.read_external_id(offset).map(Some)
+    }
+
+    /// Batch counterpart of [`external_id`](Self::external_id): the 16-byte
+    /// data slots and the shared `is_uuid` bitmap bytes (8 slots per byte,
+    /// deduplicated) are all scheduled in one pipelined
+    /// [`read_batch`](UniversalRead::read_batch) pass over `i2e`.
+    ///
+    /// Results are returned in input order; out-of-range offsets yield `None`.
+    /// Deletion is NOT applied; storage errors propagate.
+    pub fn external_ids_batch(
+        &self,
+        offsets: &[PointOffsetType],
+    ) -> OperationResult<Vec<Option<PointIdType>>> {
+        let in_range =
+            |offset: PointOffsetType| -> bool { u64::from(offset) < self.i2e_header.total };
+        let is_uuid_byte_offset = |offset: PointOffsetType| -> u64 {
+            self.i2e_header.is_uuid_offset + u64::from(offset) / 8
+        };
+
+        // Unique `is_uuid` bitmap byte positions in first-seen order.
+        let mut byte_slots: AHashMap<u64, usize> = AHashMap::new();
+        let mut unique_byte_offsets: Vec<u64> = Vec::new();
+        for &offset in offsets.iter().filter(|&&offset| in_range(offset)) {
+            byte_slots
+                .entry(is_uuid_byte_offset(offset))
+                .or_insert_with(|| {
+                    unique_byte_offsets.push(is_uuid_byte_offset(offset));
+                    unique_byte_offsets.len() - 1
+                });
+        }
+
+        let mut data_slots: Vec<Option<[u8; 16]>> = vec![None; offsets.len()];
+        let mut is_uuid_bytes: Vec<u8> = vec![0; unique_byte_offsets.len()];
+
+        // User data: `(is bitmap byte, slot)`. Data slots land in `data_slots`
+        // by input index, bitmap bytes in `is_uuid_bytes` by unique-byte slot.
+        let data_ranges = offsets
+            .iter()
+            .enumerate()
+            .filter(|&(_, &offset)| in_range(offset))
+            .map(|(idx, &offset)| {
+                let range = ReadRange {
+                    byte_offset: self.i2e_header.data_offset + u64::from(offset) * 16,
+                    length: 16,
+                };
+                ((false, idx), range)
+            });
+        let byte_ranges = unique_byte_offsets
+            .iter()
+            .enumerate()
+            .map(|(slot, &byte_offset)| ((true, slot), ReadRange::one(byte_offset)));
+
+        self.i2e
+            .read_batch::<common::generic_consts::Random, u8, (bool, usize)>(
+                data_ranges.chain(byte_ranges),
+                |(is_bitmap_byte, slot), bytes| {
+                    if is_bitmap_byte {
+                        is_uuid_bytes[slot] = bytes[0];
+                    } else {
+                        data_slots[slot] = Some(bytes.try_into().expect("16 data bytes"));
+                    }
+                    Ok(())
+                },
+            )?;
+
+        Ok(offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| {
+                let data = data_slots[idx]?;
+                let is_uuid_byte = is_uuid_bytes[byte_slots[&is_uuid_byte_offset(offset)]];
+                Some(I2eHeader::decode_slot(offset, &data, is_uuid_byte))
+            })
+            .collect())
     }
 
     fn read_external_id(&self, offset: PointOffsetType) -> OperationResult<PointIdType> {
@@ -327,6 +506,15 @@ pub fn iter_random<'a, S: UniversalRead>(
             }
         }
     }))
+}
+
+/// Keys routed to one e2i block during [`DiskMappingReader::lookup_batch`]:
+/// the block is read once and every key is binary-searched within it.
+struct BlockLookupGroup {
+    is_uuid: bool,
+    block: u64,
+    /// `(input index, key)` pairs to search within the block.
+    keys: Vec<(usize, u128)>,
 }
 
 /// Which run the [`E2iIter`] is currently walking.
