@@ -10,8 +10,8 @@ use crate::common::operation_error::OperationResult;
 impl<S: UniversalRead> LiveReload for ReadOnlySparseVectorStorage<S> {
     type Fs = S::Fs;
 
-    /// Reload the Gridstore, apply `deleted_points`, and recompute
-    /// `next_point_offset`; appended points come from the Gridstore, so
+    /// Reload the Blobstore, apply `deleted_points`, and recompute
+    /// `next_point_offset`; appended points come from the Blobstore, so
     /// `new_points` is unused.
     fn live_reload(
         &mut self,
