@@ -101,10 +101,16 @@ where
         ) -> OperationResult<()>,
     ) -> OperationResult<AHashMap<ExtendedPointId, SegmentRecordGeneric<V>>> {
         // Stage 1: resolve external → internal ids once, with deferred filtering.
-        let (resolved_ids, resolved_offsets) = self
-            .id_tracker
-            .resolve_external_ids(point_ids, deferred_behavior);
-        debug_assert_eq!(resolved_ids.len(), resolved_offsets.len());
+        let mut resolved_ids = Vec::with_capacity(point_ids.len());
+        let mut resolved_offsets = Vec::with_capacity(point_ids.len());
+        self.id_tracker.resolve_external_ids(
+            point_ids.iter().copied(),
+            deferred_behavior,
+            |point_id, offset| {
+                resolved_ids.push(point_id);
+                resolved_offsets.push(offset);
+            },
+        );
 
         // Stage 2: pre-allocate one record per point; `vectors` is `Some` only
         // when requested, so the `WithVector::Bool(false)` path needs no cleanup.
@@ -195,9 +201,9 @@ where
         hw_counter: &HardwareCounterCell,
         is_stopped: &AtomicBool,
     ) -> OperationResult<Vec<ScoredPoint>> {
-        let result_offsets: Vec<PointOffsetType> =
-            internal_result.iter().map(|scored| scored.idx).collect();
-        let external_ids = self.id_tracker.external_ids_batch(&result_offsets);
+        let external_ids = self
+            .id_tracker
+            .external_ids_batch(internal_result.iter().map(|scored| scored.idx));
 
         let (point_ids, scored_offsets): (Vec<_>, Vec<_>) = internal_result
             .into_iter()
@@ -223,9 +229,9 @@ where
             DeferredBehavior::VisibleOnly,
         )?;
 
-        let scored_offset_ids: Vec<PointOffsetType> =
-            scored_offsets.iter().map(|scored| scored.idx).collect();
-        let versions = self.id_tracker.internal_versions_batch(&scored_offset_ids);
+        let versions = self
+            .id_tracker
+            .internal_versions_batch(scored_offsets.iter().map(|scored| scored.idx));
 
         let mut results = Vec::with_capacity(point_ids.len());
 
