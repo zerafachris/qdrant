@@ -12,11 +12,11 @@ use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::str::FromStr;
 
+use blobstore::Blob;
 use common::condition_checker::ConditionChecker;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
 use itertools::Either;
 use ordered_float::OrderedFloat;
 use uuid::Uuid;

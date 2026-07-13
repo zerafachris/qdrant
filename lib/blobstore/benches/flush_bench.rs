@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
+use blobstore::fixtures::{empty_storage, random_payload};
 use common::counter::hardware_counter::HardwareCounterCell;
 use criterion::{Criterion, criterion_group, criterion_main};
-use gridstore::fixtures::{empty_storage, random_payload};
 use rand::RngExt;
 
 pub fn flush_bench(c: &mut Criterion) {
