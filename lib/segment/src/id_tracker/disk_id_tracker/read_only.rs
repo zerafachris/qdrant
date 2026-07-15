@@ -25,9 +25,7 @@ use common::universal_io::{
     CachedReadFs, OpenOptions, Populate, ReadRange, TypedStorage, UniversalRead, UniversalReadFs,
 };
 
-use super::mappings::{
-    DiskMappingsSource, log_lookup_err, log_lookup_err_batch, resolve_external_ids_batch,
-};
+use super::mappings::{DiskMappingsSource, log_lookup_err, log_lookup_err_batch};
 use super::on_disk_format::{e2i_path, i2e_path};
 use super::reader::DiskMappingReader;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -325,8 +323,8 @@ impl<S: UniversalRead> IdTrackerRead for ReadOnlyDiskIdTracker<S> {
         point_ids: impl PointIdBatch,
         _deferred_behavior: DeferredBehavior,
         callback: impl FnMut(PointIdType, PointOffsetType),
-    ) {
-        resolve_external_ids_batch(self, point_ids, callback)
+    ) -> OperationResult<()> {
+        self.resolve_internal_batch(point_ids, callback)
     }
 
     fn total_point_count(&self) -> usize {

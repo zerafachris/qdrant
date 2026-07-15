@@ -37,7 +37,7 @@ use common::universal_io::{
 use fs_err::File;
 
 pub use self::mappings::DiskMappingsSource;
-use self::mappings::{log_lookup_err, log_lookup_err_batch, resolve_external_ids_batch};
+use self::mappings::{log_lookup_err, log_lookup_err_batch};
 use self::on_disk_format::{e2i_path, i2e_path, store_e2i, store_i2e};
 pub use self::read_only::ReadOnlyDiskIdTracker;
 use self::reader::DiskMappingReader;
@@ -317,8 +317,8 @@ impl<S: UniversalWrite + Send + Sync + 'static> IdTrackerRead for DiskIdTracker<
         point_ids: impl PointIdBatch,
         _deferred_behavior: DeferredBehavior,
         callback: impl FnMut(PointIdType, PointOffsetType),
-    ) {
-        resolve_external_ids_batch(self, point_ids, callback)
+    ) -> OperationResult<()> {
+        self.resolve_internal_batch(point_ids, callback)
     }
 
     fn total_point_count(&self) -> usize {
