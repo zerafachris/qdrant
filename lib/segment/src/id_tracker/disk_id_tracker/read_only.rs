@@ -282,38 +282,36 @@ impl<S: UniversalRead> IdTrackerRead for ReadOnlyDiskIdTracker<S> {
         )
     }
 
-    /// One pipelined pass over the versions file instead of a read per point.
-    /// Out-of-range offsets yield `None`; on a storage error the remaining
-    /// slots stay `None` (the batch analogue of the single-lookup fallback).
+    /// One pipelined pass over the versions file instead of a read per point,
+    /// streaming each `(internal_id, version)` to `callback` as its read
+    /// completes. The input is walked once and nothing is buffered; out-of-range
+    /// offsets are skipped and a storage error propagates.
     fn internal_versions_batch(
         &self,
         internal_ids: impl IntoIterator<Item = PointOffsetType>,
-    ) -> Vec<Option<SeqNumberType>> {
-        let internal_ids: Vec<PointOffsetType> = internal_ids.into_iter().collect();
-        let mut results: Vec<Option<SeqNumberType>> = vec![None; internal_ids.len()];
-
+        mut callback: impl FnMut(PointOffsetType, SeqNumberType),
+    ) -> OperationResult<()> {
+        // Each read is tagged with its `internal_id` so the callback can pair it
+        // with the version; the range iterator stays lazy (no collect).
         let ranges = internal_ids
-            .iter()
-            .enumerate()
-            .filter(|&(_, &internal_id)| u64::from(internal_id) < self.versions_len)
-            .map(|(slot, &internal_id)| {
+            .into_iter()
+            .filter(|&internal_id| u64::from(internal_id) < self.versions_len)
+            .map(|internal_id| {
                 let range = ReadRange {
                     byte_offset: u64::from(internal_id) * size_of::<SeqNumberType>() as u64,
                     length: 1,
                 };
-                (slot, range)
+                (internal_id, range)
             });
-        let read = self
-            .versions
-            .read_batch::<Random, usize>(ranges, |slot, values| {
-                results[slot] = values.first().copied();
+        self.versions
+            .read_batch::<Random, PointOffsetType>(ranges, |internal_id, values| {
+                if let Some(&version) = values.first() {
+                    callback(internal_id, version);
+                }
                 Ok(())
-            });
-        if let Err(err) = read {
-            log::error!("disk id tracker batch version read failed: {err}");
-        }
+            })?;
 
-        results
+        Ok(())
     }
 
     /// Batched external→internal resolution; the behavior argument is ignored
