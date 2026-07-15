@@ -48,7 +48,9 @@ use crate::id_tracker::compressed::compressed_point_mappings::CompressedPointMap
 use crate::id_tracker::compressed::versions_store::CompressedVersions;
 use crate::id_tracker::immutable_id_tracker::{deleted_path, version_mapping_path};
 use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
-use crate::id_tracker::{DELETED_POINT_VERSION, IdTracker, IdTrackerRead, PointMappingsRefEnum};
+use crate::id_tracker::{
+    DELETED_POINT_VERSION, IdTracker, IdTrackerRead, PointIdBatch, PointMappingsRefEnum,
+};
 use crate::types::{PointIdType, SeqNumberType};
 
 /// Writable, deletion-only disk-resident id tracker.
@@ -316,7 +318,7 @@ impl<S: UniversalWrite + Send + Sync + 'static> IdTrackerRead for DiskIdTracker<
     /// (as in [`internal_id_with_behavior`](IdTrackerRead::internal_id_with_behavior)).
     fn resolve_external_ids(
         &self,
-        point_ids: impl IntoIterator<Item = PointIdType>,
+        point_ids: impl PointIdBatch,
         _deferred_behavior: DeferredBehavior,
         callback: impl FnMut(PointIdType, PointOffsetType),
     ) {
