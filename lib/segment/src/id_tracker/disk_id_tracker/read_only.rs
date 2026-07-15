@@ -64,6 +64,17 @@ impl<S: UniversalRead> ReadOnlyDiskIdTracker<S> {
         }
     }
 
+    /// Open options for the deleted flags: unlike the mapping/versions files
+    /// (read per-point, left lazy), the deleted set is read whole — per-point
+    /// deleted checks plus full materialization for search — so it is populated
+    /// as a whole, keeping those reads off remote storage.
+    fn deleted_open_options() -> OpenOptions {
+        OpenOptions {
+            populate: Populate::PreferBackground,
+            ..Self::open_options()
+        }
+    }
+
     /// Schedule background prefetch of every file [`try_open`](Self::try_open)
     /// will read
     ///
@@ -78,9 +89,12 @@ impl<S: UniversalRead> ReadOnlyDiskIdTracker<S> {
         }
 
         let options = Self::open_options();
-
         fs.schedule_prefetch(&version_mapping_path(segment_path), Some(options), None)?;
-        fs.schedule_prefetch(&deleted_path(segment_path), Some(options), None)?;
+        fs.schedule_prefetch(
+            &deleted_path(segment_path),
+            Some(Self::deleted_open_options()),
+            None,
+        )?;
 
         Ok(true)
     }
@@ -120,8 +134,12 @@ impl<S: UniversalRead> ReadOnlyDiskIdTracker<S> {
         )?);
         let versions_len = versions.len()?;
 
-        let deleted_file =
-            StoredBitSlice::open(fs, deleted_path(segment_path), options, Default::default())?;
+        let deleted_file = StoredBitSlice::open(
+            fs,
+            deleted_path(segment_path),
+            Self::deleted_open_options(),
+            Default::default(),
+        )?;
 
         Ok(Some(Self {
             path: segment_path.to_path_buf(),
@@ -213,22 +231,6 @@ impl<S: UniversalRead> DiskMappingsSource for ReadOnlyDiskIdTracker<S> {
             .deleted_file
             .get_bit(u64::from(offset))?
             .unwrap_or(true))
-    }
-
-    /// One pipelined pass over the on-disk deleted file (shared `u64` elements
-    /// deduplicated) instead of a `get_bit` round-trip per point. Still no
-    /// full-set load. Out-of-range offsets are treated as deleted.
-    fn points_deleted_batch(
-        &self,
-        offsets: impl ExactSizeIterator<Item = PointOffsetType>,
-    ) -> OperationResult<Vec<bool>> {
-        let bit_indices: Vec<u64> = offsets.map(u64::from).collect();
-        Ok(self
-            .deleted_file
-            .get_bits_batch(&bit_indices)?
-            .into_iter()
-            .map(|bit| bit.unwrap_or(true))
-            .collect())
     }
 
     fn deleted_bitslice(&self) -> OperationResult<&BitSlice> {
